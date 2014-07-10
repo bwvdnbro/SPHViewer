@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>WebGL SPH test</title>
+<style>
+/* we have to set this to be able to set relative heights for other containers
+   we can't set this value to 100%, since then the scrollbar appears and makes the window slightly larger */
+body, html { height: 98%;
+             overflow: hidden;
+           }
+
+/* style for the 3D canvas. We make it fill the entire window
+   the position attributes are there to remove any margins and padding inherited from the body */
+#view { height: 100%;
+        width: 100%;
+        position: absolute;
+        top: 0px;
+        left: 0px;
+        background-color: black;
+      }
+
+/* style for a container that is used by the scripts to dump output to */
+#output { position: absolute;
+          top: 0px;
+          left: 550px;
+          height: 500px;
+          overflow-y: scroll;
+        }
+#menu_button { position: absolute;
+               top: 0px;
+               right: 5px;
+               height: 50px;
+               width: 100px;
+               text-align: center;
+               z-index: 3;
+             }
+#menu { position: absolute;
+        top: 50px;
+        right: 50px;
+        height: 400px;
+        width: 250px;
+        background-color: rgba(255, 255, 255, 0.6);
+        display: none;
+        padding-left: 20px;
+        color: white;
+        overflow-y: auto;
+      }
+#strengthOutput { width: 30px;
+               }
+input { vertical-align: middle;
+      }
+#printscreen { position: absolute;
+               top: 50px;
+               left: 50px;
+               width: 80%;
+               height: 80%;
+               z-index: 2;
+             }
+#topbox { position: absolute;
+          top: 0px;
+          left: 0px;
+          width: 100%;
+          height: 100px;
+          z-index: 2;
+          background-color: rgb(120, 120, 120);
+        }
+#topframe { position: absolute;
+            top: 100px;
+            left: 0px;
+            width: 100%;
+            height: 50px;
+            z-index: 2;
+            background: linear-gradient(to bottom, rgba(120, 120, 120, 1.0), rgba(120, 120, 120, 0.0));
+          }
+#leftframe { position: absolute;
+             top: 100px;
+             left: 0px;
+             width: 50px;
+             height: 100%;
+             z-index: 1;
+             background: linear-gradient(to right, rgba(120, 120, 120, 1.0), rgba(120, 120, 120, 0.0));
+           }
+#rightframe { position: absolute;
+              top: 100px;
+              right: 0px;
+              width: 50px;
+              height: 100%;
+              z-index: 1;
+              background: linear-gradient(to left, rgba(120, 120, 120, 1.0), rgba(120, 120, 120, 0.0));
+            }
+#bottomframe { position: absolute;
+               bottom: 0px;
+               left: 0px;
+               width: 100%;
+               height: 50px;
+               z-index: 2;
+               background: linear-gradient(to top, rgba(120, 120, 120, 1.0), rgba(120, 120, 120, 0.0));
+             }
+
+</style>
+<!-- Library that contains methods to perform the fastest matrix and vector operations in JavaScript -->
+<script src="gl-matrix-min.js"></script>
+<!-- Fragment shader. Called for separate pixels in the view. We need to set the pixel color -->
+<script id="shader-fs" type="x-shader/x-fragment">
+precision mediump float;
+
+varying float vColor;
+varying vec3 vTextureCoord;
+varying float vNorm;
+
+uniform sampler2D uSampler;
+uniform float strength;
+uniform float densityStrength;
+
+void main(void){
+  // the texture sets the alpha channel of the color
+  //gl_FragColor = 1.0*log(1.0+vNorm*texture2D(uSampler, vec2(vTextureCoord.s, vTextureCoord.t)));
+  gl_FragColor = densityStrength*vNorm*texture2D(uSampler, vec2(vTextureCoord.s, vTextureCoord.t));
+  // the RGB colors are set using the vColor variable, which is passed on from the vertex shader
+  float color = 100.0*log(1.0+vColor);
+  gl_FragColor = vec4(strength*color, strength*(1.0-color), 1.0, gl_FragColor[3]);
+  //gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+}
+</script>
+<!-- Vertex shader. Called for every vertex in the view. We need to set the position of the vertex
+     and some variables that are passed on to the fragment shader -->
+<script id="shader-vs" type="x-shader/x-vertex">
+attribute vec3 aVertexPosition;
+attribute vec4 aVertexColor;
+attribute vec3 aTextureCoord;
+attribute float aSmoothing;
+attribute float aDensity;
+attribute float aTemperature;
+
+uniform mat4 uMVMatrix;
+uniform mat4 uPMatrix;
+
+varying float vColor;
+varying vec3 vTextureCoord;
+varying float vNorm;
+
+void main(void){
+  // we first rotate the center and then calculate the box starting from this position
+  // the box has the size of the smoothing length. The texture coordinates tell us which corner we deal with
+  // we don't rotate the corners w.r.t. to the center to make sure we always see the front of the square in the view
+  vec4 vertexPosition = uMVMatrix*vec4(aVertexPosition, 1.0) + 2.0*vec4(aTextureCoord,1.0)*aSmoothing-aSmoothing;
+  // we have to convert the position to fit the perspective
+  gl_Position = uPMatrix * vertexPosition;
+  vColor = aTemperature;
+  vTextureCoord = aTextureCoord;
+  vNorm = 10.0*aDensity;
+}
+</script>
+<!-- Main scripts that rule the 3D view -->
+<script>
+// the 3D view and shader program
+var gl;
+var shaderProgram;
+var densityStrength = 1.0;
+
+// class representing a set of points with properties and a given texture to represent them
+function PointCollection(positions, densities, smoothings, temperatures, texture){
+  this.numPoints = positions.length/3;
+  // funny detail: WebGL can't handle buffers of size bigger than 65536 (2^16), due to the indices
+  // being limited to 16-bit integers
+  // solution: split the problem up in smaller buffers
+  if(6*this.numPoints > 65536){
+    this.numBuffer = Math.ceil((6*this.numPoints)/65536);
+    this.pieceSize = Math.floor(this.numPoints/this.numBuffer);
+    this.positionBuffer = [];
+    this.indexBuffer = [];
+    this.textureBuffer = [];
+    this.densityBuffer = [];
+    this.smoothingBuffer = [];
+    this.temperatureBuffer = [];
+    this.numItems = []
+    for(var i = 0; i < this.numBuffer; i++){
+      var numThisBuffer = Math.min(this.pieceSize, this.numPoints-i*this.pieceSize);
+      var vertices = new Float32Array(12*numThisBuffer);
+      var cubeVertexIndices = new Uint16Array(6*numThisBuffer);
+      var textureCoords = new Float32Array(8*numThisBuffer);
+      var vertexDensities = new Float32Array(4*numThisBuffer);
+      var vertexSmoothings = new Float32Array(4*numThisBuffer);
+      var vertexTemperatures = new Float32Array(4*numThisBuffer);
+      for(var p = 0; p < numThisBuffer; p++){
+        for(var j = 0; j < 4; j++){
+          vertices[12*p+3*j] = positions[3*(i*this.pieceSize+p)];
+          vertices[12*p+3*j+1] = positions[3*(i*this.pieceSize+p)+1];
+          vertices[12*p+3*j+2] = positions[3*(i*this.pieceSize+p)+2];
+          vertexDensities[4*p+j] = densities[(i*this.pieceSize+p)];
+          vertexSmoothings[4*p+j] = smoothings[(i*this.pieceSize+p)];
+          vertexTemperatures[4*p+j] = temperatures[(i*this.pieceSize+p)];
+        }
+        cubeVertexIndices[6*p] = 4*p;
+        cubeVertexIndices[6*p+1] = 4*p+1;
+        cubeVertexIndices[6*p+2] = 4*p+2;
+        cubeVertexIndices[6*p+3] = 4*p;
+        cubeVertexIndices[6*p+4] = 4*p+2;
+        cubeVertexIndices[6*p+5] = 4*p+3;
+        textureCoords[8*p] = 0.0;
+        textureCoords[8*p+1] = 0.0;
+        textureCoords[8*p+2] = 1.0;
+        textureCoords[8*p+3] = 0.0;
+        textureCoords[8*p+4] = 1.0;
+        textureCoords[8*p+5] = 1.0;
+        textureCoords[8*p+6] = 0.0;
+        textureCoords[8*p+7] = 1.0;
+      }
+      this.positionBuffer[i] = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer[i]);
+      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+      
+      this.indexBuffer[i] = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer[i]);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeVertexIndices, gl.STATIC_DRAW);
+      
+      this.textureBuffer[i] = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.textureBuffer[i]);
+      gl.bufferData(gl.ARRAY_BUFFER, textureCoords, gl.STATIC_DRAW);
+      
+      this.densityBuffer[i] = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.densityBuffer[i]);
+      gl.bufferData(gl.ARRAY_BUFFER, vertexDensities, gl.STATIC_DRAW);
+      
+      this.smoothingBuffer[i] = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.smoothingBuffer[i]);
+      gl.bufferData(gl.ARRAY_BUFFER, vertexSmoothings, gl.STATIC_DRAW);
+      
+      this.temperatureBuffer[i] = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.temperatureBuffer[i]);
+      gl.bufferData(gl.ARRAY_BUFFER, vertexTemperatures, gl.STATIC_DRAW);
+      
+      this.numItems[i] = 6*numThisBuffer;
+    }
+    this.texture = texture;
+    
+    this.draw = function(){
+      for(var i = 0; i < this.numBuffer; i++){
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer[i]);
+        gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, 3, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.textureBuffer[i]);
+        gl.vertexAttribPointer(shaderProgram.vertexTextureCoordAttribute, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.densityBuffer[i]);
+        gl.vertexAttribPointer(shaderProgram.vertexDensityAttribute, 1, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.smoothingBuffer[i]);
+        gl.vertexAttribPointer(shaderProgram.vertexSmoothingAttribute, 1, gl.FLOAT, false, 0, 0);
+        if(document.getElementById("variableSelection").value == "temperature"){
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.temperatureBuffer[i]);
+          gl.vertexAttribPointer(shaderProgram.vertexTemperatureAttribute, 1, gl.FLOAT, false, 0, 0);
+        } else {
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.densityBuffer[i]);
+          gl.vertexAttribPointer(shaderProgram.vertexTemperatureAttribute, 1, gl.FLOAT, false, 0, 0);
+        }
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer[i]);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.uniform1i(shaderProgram.samplerUniform, 0);
+        gl.drawElements(gl.TRIANGLES, this.numItems[i], gl.UNSIGNED_SHORT, 0);
+      }
+    };
+  } else {
+    var vertices = new Float32Array(12*this.numPoints);
+    var cubeVertexIndices = new Uint16Array(6*this.numPoints);
+    var textureCoords = new Float32Array(8*this.numPoints);
+    var vertexDensities = new Float32Array(4*this.numPoints);
+    var vertexSmoothings = new Float32Array(4*this.numPoints);
+    var vertexTemperatures = new Float32Array(4*this.numPoints);
+    // convert the data to a representation consisting of squares that are representable in the view
+    for(var i = 0; i <  numpoints; i++){
+      for(var j = 0; j < 4; j++){
+        vertices[12*i+3*j] = positions[3*i];
+        vertices[12*i+3*j+1] = positions[3*i+1];
+        vertices[12*i+3*j+2] = positions[3*i+2];
+        vertexDensities[4*i+j] = densities[i];
+        vertexSmoothings[4*i+j] = smoothings[i];
+        vertexTemperatures[4*i+j] = temperatures[i];
+      }
+      cubeVertexIndices[6*i] = 4*i;
+      cubeVertexIndices[6*i+1] = 4*i+1;
+      cubeVertexIndices[6*i+2] = 4*i+2;
+      cubeVertexIndices[6*i+3] = 4*i;
+      cubeVertexIndices[6*i+4] = 4*i+2;
+      cubeVertexIndices[6*i+5] = 4*i+3;
+      textureCoords[8*i] = 0.0;
+      textureCoords[8*i+1] = 0.0;
+      textureCoords[8*i+2] = 1.0;
+      textureCoords[8*i+3] = 0.0;
+      textureCoords[8*i+4] = 1.0;
+      textureCoords[8*i+5] = 1.0;
+      textureCoords[8*i+6] = 0.0;
+      textureCoords[8*i+7] = 1.0;
+    }
+    this.positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+    this.positionBuffer.itemSize = 3;
+    this.positionBuffer.numItems = 4*numpoints;
+    
+    this.indexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeVertexIndices, gl.STATIC_DRAW);
+    this.indexBuffer.itemSize = 1;
+    this.indexBuffer.numItems = 6*numpoints;
+    
+    this.textureBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.textureBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, textureCoords, gl.STATIC_DRAW);
+    this.textureBuffer.itemSize = 2;
+    this.textureBuffer.numItems = 4*numpoints;
+    
+    this.densityBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.densityBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertexDensities, gl.STATIC_DRAW);
+    this.densityBuffer.itemSize = 1;
+    this.densityBuffer.numItems = 4*numpoints;
+    
+    this.smoothingBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.smoothingBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertexSmoothings, gl.STATIC_DRAW);
+    this.smoothingBuffer.itemSize = 1;
+    this.smoothingBuffer.numItems = 4*numpoints;
+    
+    this.temperatureBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.temperatureBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertexTemperatures, gl.STATIC_DRAW);
+    this.temperatureBuffer.itemSize = 1;
+    this.temperatureBuffer.numItems = 4*numpoints;
+    
+    this.texture = texture;
+    
+    this.draw = function(){
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+      gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, this.positionBuffer.itemSize, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.textureBuffer);
+      gl.vertexAttribPointer(shaderProgram.vertexTextureCoordAttribute, this.textureBuffer.itemSize, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.densityBuffer);
+      gl.vertexAttribPointer(shaderProgram.vertexDensityAttribute, this.densityBuffer.itemSize, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.smoothingBuffer);
+      gl.vertexAttribPointer(shaderProgram.vertexSmoothingAttribute, this.smoothingBuffer.itemSize, gl.FLOAT, false, 0, 0);
+      if(document.getElementById("variableSelection").value == "temperature"){
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.temperatureBuffer);
+        gl.vertexAttribPointer(shaderProgram.vertexTemperatureAttribute, this.temperatureBuffer.itemSize, gl.FLOAT, false, 0, 0);
+      } else {
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.densityBuffer);
+        gl.vertexAttribPointer(shaderProgram.vertexTemperatureAttribute, this.temperatureBuffer.itemSize, gl.FLOAT, false, 0, 0);
+      }
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.texture);
+      gl.uniform1i(shaderProgram.samplerUniform, 0);
+      gl.drawElements(gl.TRIANGLES, this.indexBuffer.numItems, gl.UNSIGNED_SHORT, 0);
+    };
+  }
+};
+
+var gasCollection;
+var starCollection;
+
+// view, perspective and rotation matrix
+var mvMatrix = mat4.create();
+var pMatrix = mat4.create();
+var rMatrix = mat4.create();
+
+// position of the center of the view (which is also the center of rotation)
+var center_x = 0.0;
+var center_y = 0.0;
+var center_z = -5.0;
+
+// textures
+var texture;
+var startexture;
+
+// function that compiles the shader located in the script element with the given id
+function getShader(gl, id){
+  var shaderScript = document.getElementById(id);
+  if(!shaderScript){
+    return null;
+  }
+  
+  var str = "";
+  var k = shaderScript.firstChild;
+  while(k){
+    if(k.nodeType == 3){
+      str += k.textContent;
+    }
+    k = k.nextSibling;
+  }
+  
+  var shader;
+  if(shaderScript.type == "x-shader/x-fragment"){
+    shader = gl.createShader(gl.FRAGMENT_SHADER);
+  } else if(shaderScript.type == "x-shader/x-vertex"){
+    shader = gl.createShader(gl.VERTEX_SHADER);
+  } else {
+    return null;
+  }
+  
+  gl.shaderSource(shader, str);
+  gl.compileShader(shader);
+  
+  if(!gl.getShaderParameter(shader, gl.COMPILE_STATUS)){
+    alert(gl.getShaderInfoLog(shader));
+    return null;
+  }
+  
+  return shader;
+}
+
+// simple helper function to convert degrees to radians
+function degToRad(degrees){
+  return degrees * Math.PI / 180.0;
+}
+
+// update the uniform view and perspective matrices on the GPU with the values of their JavaScript counterparts
+function setMatrixUniforms(){
+  gl.uniformMatrix4fv(shaderProgram.pMatrixUniform, false, pMatrix);
+  gl.uniformMatrix4fv(shaderProgram.mvMatrixUniform, false, mvMatrix);
+}
+
+// draw the scene in the 3D view
+function drawScene(){
+  // set the viewport and clear its contents
+  gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  mat4.perspective(pMatrix, 45.0, gl.viewportWidth/gl.viewportHeight, 0.1, 100.0);
+  // initialize the view matrix
+  mat4.identity(mvMatrix);
+  // move the center of the view to the apropriate position
+  mat4.translate(mvMatrix, mvMatrix, [center_x, center_y, center_z]);
+  // rotate the view with the current rotation matrix
+  mat4.multiply(mvMatrix, mvMatrix, rMatrix);
+  // copy the matrix values to the GPU
+  setMatrixUniforms();
+  
+  gl.uniform1f(shaderProgram.strength, 1.0);
+  gl.uniform1f(shaderProgram.densityStrength, densityStrength);
+  gasCollection.draw();
+  gl.uniform1f(shaderProgram.strength, 100.0);
+  gl.uniform1f(shaderProgram.densityStrength, 100.0);
+  starCollection.draw();
+}
+
+// initialize the 3D view
+function initGL(canvas){
+  try{
+    gl = canvas.getContext("experimental-webgl", {preserveDrawingBuffer: true});
+    canvas.width = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+    gl.viewportWidth = canvas.width;
+    gl.viewportHeight = canvas.height;
+  } catch(e) {
+  }
+  if(!gl){
+    alert("Could not initialise WebGL");
+  }
+}
+
+// compile the shaders and make links to some GPU variables
+function initShaders(){
+  var fragmentShader = getShader(gl, "shader-fs");
+  var vertexShader = getShader(gl, "shader-vs");
+  
+  shaderProgram = gl.createProgram();
+  gl.attachShader(shaderProgram, vertexShader);
+  gl.attachShader(shaderProgram, fragmentShader);
+  gl.linkProgram(shaderProgram);
+  
+  if(!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)){
+    alert("Could not initialise shaders");
+  }
+  
+  gl.useProgram(shaderProgram);
+  shaderProgram.vertexPositionAttribute = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+  gl.enableVertexAttribArray(shaderProgram.vertexPositionAttribute);
+  
+  shaderProgram.vertexColorAttribute = gl.getAttribLocation(shaderProgram, "aVertexColor");
+  gl.enableVertexAttribArray(shaderProgram.vertexColorAttribute);
+  
+  shaderProgram.vertexTextureCoordAttribute = gl.getAttribLocation(shaderProgram, "aTextureCoord");
+  gl.enableVertexAttribArray(shaderProgram.vertexTextureCoordAttribute);
+  
+  shaderProgram.vertexDensityAttribute = gl.getAttribLocation(shaderProgram, "aDensity");
+  gl.enableVertexAttribArray(shaderProgram.vertexDensityAttribute);
+  
+  shaderProgram.vertexSmoothingAttribute = gl.getAttribLocation(shaderProgram, "aSmoothing");
+  gl.enableVertexAttribArray(shaderProgram.vertexSmoothingAttribute);
+  
+  shaderProgram.vertexTemperatureAttribute = gl.getAttribLocation(shaderProgram, "aTemperature");
+  gl.enableVertexAttribArray(shaderProgram.vertexTemperatureAttribute);
+  
+  shaderProgram.pMatrixUniform = gl.getUniformLocation(shaderProgram, "uPMatrix");
+  shaderProgram.mvMatrixUniform = gl.getUniformLocation(shaderProgram, "uMVMatrix");
+  shaderProgram.strength = gl.getUniformLocation(shaderProgram, "strength");
+  shaderProgram.densityStrength = gl.getUniformLocation(shaderProgram, "densityStrength");
+}
+
+// calculate the textures
+// both star and gas are currently spline kernels, with the star texture having a much smaller smoothing length
+// only the alpha channel of the texture matters, but we set the RGB values to plain red for separate visualization
+function initTexture(){
+  // gas texture
+  var pixels = new Uint8Array(256*256*4);
+  var h = 0.5;
+  var norm = 32.0/3.0/50.0;
+  for(var i = 0; i < 256; i++){
+    for(var j = 0; j < 256; j++){
+      var x = i*1.0/256.0 - 0.5;
+      var y = j*1.0/256.0 - 0.5;
+      var offset = (i*256+j)*4;
+      var r = Math.sqrt(x*x + y*y);
+      var u = r/h;
+      if(u > 1.0){
+        pixels[offset] = 0;
+        pixels[offset+1] = 0;
+        pixels[offset+2] = 0;
+        pixels[offset+3] = 0;
+      } else {
+        var kernel;
+        if(u < 0.5){
+          var u2 = u*u;
+          kernel = 1.0 - 6.0*u2 + 6.0*u*u2;
+        } else {
+          u = 1.0-u;
+          u *= u*u;
+          kernel = 2.0*u;
+        }
+        pixels[offset] = 255;
+        pixels[offset+1] = 0;
+        pixels[offset+2] = 0;
+        pixels[offset+3] = norm*kernel*255;
+      }
+    }
+  }
+  texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  
+  // star texture
+  pixels = new Uint8Array(256*256*4);
+  h = 0.04;
+  norm = 0.5;
+  for(var i = 0; i < 256; i++){
+    for(var j = 0; j < 256; j++){
+      var x = i*1.0/256.0 - 0.5;
+      var y = j*1.0/256.0 - 0.5;
+      var offset = (i*256+j)*4;
+      var r = Math.sqrt(x*x + y*y);
+      var u = r/h;
+      if(u > 1.0){
+        pixels[offset] = 0;
+        pixels[offset+1] = 0;
+        pixels[offset+2] = 0;
+        pixels[offset+3] = 0;
+      } else {
+        var kernel;
+        if(u < 0.5){
+          var u2 = u*u;
+          kernel = 1.0 - 6.0*u2 + 6.0*u*u2;
+        } else {
+          u = 1.0-u;
+          u *= u*u;
+          kernel = 2.0*u;
+        }
+        pixels[offset] = 255;
+        pixels[offset+1] = 0;
+        pixels[offset+2] = 0;
+        pixels[offset+3] = norm*kernel*255;
+      }
+    }
+  }
+  startexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, startexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  
+  // uncomment the code below to display the star texture
+  //var c = document.createElement("canvas");
+  //c.width = 256;
+  //c.height = 256;
+  //document.body.appendChild(c);
+  //var context = c.getContext("2d");
+  //var id = context.getImageData(0, 0, c.width, c.height);
+  //var numBytes = c.width*c.height * 4;
+  //for(var ii = 0; ii < numBytes; ii++){
+  //  id.data[ii] = pixels[ii];
+  //}
+  //context.putImageData(id, 0, 0);
+}
+
+// load the data from the gas.dat and stars.dat files and put them in buffers on the GPU
+function initPoints(){
+  // the file is still on the server, so we should download it using a simple HTTP request
+  var req = new XMLHttpRequest();
+  req.open("GET", "gas.dat", true);
+  // signal that the data consists of a buffer of bytes
+  req.responseType = "arraybuffer";
+  // the actual reading of the data can only happen if the file downloaded succesfully, at which point this function is called
+  req.onload = function(oEvent){
+    // we convert the byte buffer to an array of floats
+    var data = new Float32Array(req.response);
+    // each row in the gas.dat file has 6 columns, so we have data.length/6 points
+    numpoints = data.length/6;
+    //numpoints = 100;
+    // initialize temporary arrays to read the data
+    if(true){
+    var pointpositions = new Float32Array(3*numpoints);
+    var smoothinglengths = new Float32Array(numpoints);
+    var densities = new Float32Array(numpoints);
+    var maxdensity = 0.0;
+    var temperatures = new Float32Array(numpoints);
+    var maxtemperature = 0.0;
+    for(var i = 0; i < numpoints; i++){
+      pointpositions[3*i] = data[6*i];
+      pointpositions[3*i+1] = data[6*i+1];
+      pointpositions[3*i+2] = data[6*i+2];
+      densities[i] = data[6*i+3];
+      maxdensity = Math.max(maxdensity, densities[i]);
+      smoothinglengths[i] = data[6*i+4];
+      temperatures[i] = data[6*i+5];
+      maxtemperature = Math.max(maxtemperature, temperatures[i]);
+    }
+    } else {
+    var pp = [];
+    var sl = []
+    var dt = [];
+    var tp = []
+    var md = 0.0;
+    var mt = 0.0;
+    for(var i = 0; i < numpoints; i++){
+      if(data[6*i+3] > 0.01){
+        pp[pp.length] = data[6*i];
+        pp[pp.length] = data[6*i+1];
+        pp[pp.length] = data[6*i+2];
+        dt[dt.length] = data[6*i+3];
+        sl[sl.length] = data[6*i+4];
+        tp[tp.length] = data[6*i+5];
+        md = Math.max(md, dt[dt.length-1]);
+        mt = Math.max(mt, tp[tp.length-1]);
+      }
+    }
+    var pointpositions = new Float32Array(pp);
+    var smoothinglengths = new Float32Array(sl);
+    var densities = new Float32Array(dt);
+    var temperatures = new Float32Array(tp);
+    var maxdensity = md;
+    var maxtemperature = mt;
+    }
+    // we normalize the density and temperature to make sure all values are in the interval [0.0,1.0]
+    for(var i = 0; i < densities.length; i++){
+      densities[i] /= maxdensity;
+      temperatures[i] /= maxtemperature;
+    }
+    gasCollection = new PointCollection(pointpositions, densities, smoothinglengths, temperatures, texture);
+    // uncomment these lines to output the data
+    //var outdiv = document.getElementById("output");
+    //for(var i = 0; i < numpoints; i++){
+    //  var line = document.createElement("p");
+    //  line.innerHTML = i + ": " + pointpositions[3*i] + ", " + pointpositions[3*i+1] + ", " + pointpositions[3*i+2] + ", " + densities[i] + ", " + smoothinglengths[i];
+    //  outdiv.appendChild(line);
+    //}
+    
+    // since this function was called with some delay, we have to redraw the entire scene (but now with gas data)
+    drawScene();
+  };
+  // send the HTTP request, this starts the download
+  req.send(null);
+  
+  // process the star data
+  var req2 = new XMLHttpRequest();
+  req2.open("GET", "stars.dat", true);
+  req2.responseType = "arraybuffer";
+  req2.onload = function(oEvent){
+    var data = new Float32Array(req2.response);
+    numpoints = data.length/3;
+    //numpoints = 100;
+    var pointpositions = new Float32Array(3*numpoints);
+    var smoothinglengths = new Float32Array(numpoints);
+    var densities = new Float32Array(numpoints);
+    var temperatures = new Float32Array(numpoints);
+    var maxtemperature = 1.0;
+    var maxdensity = 0.0;
+    for(var i = 0; i < numpoints; i++){
+      pointpositions[3*i] = data[3*i];
+      pointpositions[3*i+1] = data[3*i+1];
+      pointpositions[3*i+2] = data[3*i+2];
+      densities[i] = 0.00116;
+      maxdensity = Math.max(maxdensity, densities[i]);
+      smoothinglengths[i] = 0.05;
+      temperatures[i] = 0.00116;
+      maxtemperature = Math.max(maxtemperature, temperatures[i]);
+    }
+    starCollection = new PointCollection(pointpositions, densities, smoothinglengths, temperatures, startexture);
+    
+    drawScene();
+  };
+  req2.send(null);
+  
+  // initialize the rotation matrix for the view to the unity matrix
+  mat4.identity(rMatrix);
+}
+
+// some global variables containing the state of the mouse
+var mouseDown = false;
+var lastMouseX = null;
+var lastMouseY = null;
+var mouseIn = false;
+
+// fired when the mouse is clicked inside the canvas
+// enables the handling of mouse moves and saves the current pointer location
+function handleMouseDown(event) {
+  mouseDown = true;
+  lastMouseX = event.clientX;
+  lastMouseY = event.clientY;
+}
+
+// fired when the mouse is released somewhere in the DOCUMENT
+// (to prevent problems with the mouse being clicked inside the canvas and released outside)
+// disables the handling of mouse moves
+function handleMouseUp(event) {
+  mouseDown = false;
+}
+
+// fired when the mouse moves and mouse moves are enabled
+// the rotation matrix of the view is rotated by an amount and direction set by the
+// movement of the mouse w.r.t. the point where it was first clicked
+function handleMouseMove(event) {
+  if (!mouseDown) {
+    return;
+  }
+  var newX = event.clientX;
+  var newY = event.clientY;
+
+  var newrMatrix = mat4.create();
+  mat4.identity(newrMatrix);
+
+  var deltaX = newX - lastMouseX;
+  mat4.rotate(newrMatrix, newrMatrix, degToRad(deltaX/10), [0, 1, 0]);
+  
+  var deltaY = newY - lastMouseY;
+  mat4.rotate(newrMatrix, newrMatrix, degToRad(deltaY/10), [1, 0, 0]);
+  
+  // this seems to be the way to do this, see http://learningwebgl.com/blog/?p=1253
+  mat4.multiply(rMatrix, newrMatrix, rMatrix);
+
+  lastMouseX = newX
+  lastMouseY = newY;
+  // redraw the scene to process the changes
+  drawScene();
+}
+
+// fired when the mousewheel moves inside the canvas
+// moves the center of the view (center of rotation) by an amount set by the
+// amount of rotation
+function handleMouseWheel(event){
+  var delta = 0;
+  // mousewheel events are not standardized properly, this code enables proper handling for different browsers
+  if(event.wheelDelta){
+    delta = event.wheelDelta / 60;
+  } else {
+    delta = -event.detail / 2;
+  }
+  center_z += delta*0.1;
+  // update the scene
+  drawScene();
+}
+
+// fired when the mouse pointer moves into the canvas
+// enables keyboard actions in the canvas
+function handleMouseOver(event){
+  mouseIn = true;
+}
+
+// fired when the mouse pointer leaves the canvas
+// disables keyboard actions in the canvas
+function handleMouseOut(event){
+  mouseIn = false;
+}
+
+// fired when any key on the keyboard is pressed
+// only active when the mouse pointer is inside the canvas
+// we connect events to the keys with following codes:
+//   * 37: arrow left
+//   * 38: arrow up
+//   * 39: arrow right
+//   * 40: arrow down
+function handleKeyDown(event){
+  if(mouseIn){
+    if(event.keyCode == 37 || event.keyCode == 39){
+      // x direction
+      if(event.keyCode == 37){
+        // left
+        center_x += 0.1;
+        drawScene();
+      } else {
+        // right
+        center_x -= 0.1;
+        drawScene();
+      }
+    } else if(event.keyCode == 38 || event.keyCode == 40){
+      // y direction
+      if(event.keyCode == 38){
+        // up
+        center_y -= 0.1;
+        drawScene();
+      } else {
+        // down
+        center_y += 0.1;
+        drawScene();
+      }
+    }
+    if(event.keyCode == 69){
+      var strengthSlider = document.getElementById("strengthSlider");
+      // the 1.0 is necessary to make it work (some sort of type problem)
+      strengthSlider.value = 1.0*strengthSlider.value + 0.1;
+      strengthChange();
+    }
+    if(event.keyCode == 68){
+      var strengthSlider = document.getElementById("strengthSlider");
+      // the 1.0 is necessary to make it work (some sort of type problem)
+      strengthSlider.value = 1.0*strengthSlider.value - 0.1;
+      strengthChange();
+    }
+    if(event.keyCode == 80){
+      // make printscreen
+      printscreen();
+    }
+  }
+}
+
+function printscreen(){
+  var canvas = document.getElementById("view");
+  var imgcanvas = document.createElement("canvas");
+  imgcanvas.width = canvas.width;
+  imgcanvas.height = canvas.height;
+  
+  var context = imgcanvas.getContext('2d');
+  context.fillStyle = "black";
+  context.fillRect(0, 0, imgcanvas.width, imgcanvas.height)
+  context.drawImage(canvas, 0, 0);
+  var url = imgcanvas.toDataURL();
+  
+  window.open(url);
+}
+
+// main function
+// initialize the view, set event handlers and load data
+function webGLStart(){
+  var canvas = document.getElementById("view");
+  canvas.onmousedown = handleMouseDown;
+  canvas.onmouseover = handleMouseOver;
+  canvas.onmouseout = handleMouseOut;
+  document.onmouseup = handleMouseUp;
+  document.onmousemove = handleMouseMove;
+  // firefox does not recognize the onmousewheel event...
+  if(window.addEventListener){
+    canvas.addEventListener('DOMMouseScroll', handleMouseWheel, false);
+  } else {
+    canvas.onmousewheel = handleMouseWheel;
+  }
+  document.onkeydown = handleKeyDown;
+  document.getElementById("strengthSlider").value = 0.0;
+  document.getElementById("strengthOutput").value = 1.0;
+  initGL(canvas);
+  initShaders();
+  initTexture();
+  initPoints();
+  
+  // fill the 3D view with black
+  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  // set transparency
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.enable(gl.BLEND);
+}
+
+var menuflag = false;
+function toggle_menu(){
+  menu = document.getElementById("menu");
+  if(menuflag){
+    menu.style.display = "none";
+    menuflag = false;
+  } else {
+    menu.style.display = "inline";
+    menuflag = true;
+  }
+}
+
+function strengthChange(){
+  var strengthOutput = document.getElementById("strengthOutput");
+  var strengthSlider = document.getElementById("strengthSlider");
+  strengthOutput.value = Math.pow(10.0, strengthSlider.value);
+  densityStrength = strengthOutput.value;
+  drawScene();
+}
+</script>
+</head>
+<body onload="webGLStart();">
+<canvas id="view"></canvas>
+<!--<div id="output">-->
+<!--<h1>Output</h1>-->
+<!--</div>-->
+<div id="menu_button">
+<input type="button" value="menu" onclick="toggle_menu()" />
+</div>
+<div id="menu">
+<p>Strength</p>
+<p><input id="strengthSlider" type="range" min="-2.0" max="2.0" step="0.1" onchange="strengthChange()" /><input id="strengthOutput" type="text" disabled /></p>
+<p>Variable
+<select id="variableSelection" onchange="drawScene()">
+<option value="density" selected="selected">Density</option>
+<option value="temperature">Temperature</option>
+</select></p>
+<p><input type="button" value="Save to png" onclick="printscreen()" /></p>
+</div>
+<!--<div id="topbox"></div>-->
+<!--<div id="topframe"></div>-->
+<!--<div id="leftframe"></div>-->
+<!--<div id="rightframe"></div>-->
+<!--<div id="bottomframe"></div>-->
+</body>
+</html>
