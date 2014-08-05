@@ -8,7 +8,34 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <getopt.h>
 using namespace std;
+
+bool stereo = false;
+
+void parse_options(int argc, char** argv){
+  static struct option long_options[] = {
+    {"stereo", no_argument, 0, 's'},
+    {0, 0, 0, 0}
+  };
+  
+  int c;
+  opterr = 0;
+  while((c = getopt_long(argc, argv, "s", long_options, NULL)) != -1){
+    switch(c){
+      case 's':
+        stereo = true;
+        cout << "Displaying stereo view" << endl;
+        break;
+      case '?':
+        cout << "unknown option: " << argv[optind-1] << endl;
+        break;
+      default:
+        cout << "error" << endl;
+        break;
+    }
+  }
+}
 
 string B_to_string(unsigned int bytes){
   stringstream result;
@@ -237,6 +264,19 @@ private:
     }
     glutPostRedisplay();
   }
+  
+  // since the angle for stereo viewing is always small, we do not recalculate the order for every eye
+  // this makes a huge difference in computation time
+  void rotate_x(double xangle){
+    double c1 = cos(xangle);
+    double s1 = sin(xangle);
+    float newrmatrix[16] = {c1, 0., s1, 0.,
+                            0., 1., 0., 0.,
+                            -s1, 0., c1, 0.,
+                            0., 0., 0., 1.};
+    multiply(_rmatrix, newrmatrix);
+    glutPostRedisplay();
+  }
 
 public:
   Window(int* argc, char** argv, int width, int height){
@@ -260,7 +300,11 @@ public:
     unit_matrix(_cmatrix);
     
     glutInit(argc, argv);
-    glutInitDisplayMode(GL_DOUBLE);
+    if(stereo){
+      glutInitDisplayMode(GLUT_STEREO | GL_DOUBLE);
+    } else {
+      glutInitDisplayMode(GL_DOUBLE);
+    }
     
     glutInitWindowSize(width, height);
     glutCreateWindow("3D SPH viewer");
@@ -291,6 +335,21 @@ public:
     glutMainLoop();
   }
   
+  void displaywrapper(){
+    if(stereo){
+      glDrawBuffer(GL_BACK_LEFT);
+      display();
+      double view_angle = 0.034906585;
+      rotate_x(view_angle);
+      glDrawBuffer(GL_BACK_RIGHT);
+      display();
+      rotate_x(-view_angle);
+    } else {
+      display();
+    }
+    glutSwapBuffers();
+  }
+  
   void display(){
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glUseProgram(_program->get_program());
@@ -301,7 +360,6 @@ public:
     for(unsigned int i = 0; i < _components.size(); i++){
       _components[i]->draw(_program, _camera);
     }
-    glutSwapBuffers();
   }
   
   void resize(int width, int height){
@@ -367,7 +425,7 @@ public:
   }
   
   static void displayWrapper(){
-    ((Window*)window_instance)->display();
+    ((Window*)window_instance)->displaywrapper();
   }
   
   static void resizeWrapper(int width, int height){
@@ -658,6 +716,7 @@ public:
 };
 
 int main(int argc, char** argv){
+  parse_options(argc, argv);
   Window window(&argc, argv, 400, 400);
   
   vector<string> uniforms;
