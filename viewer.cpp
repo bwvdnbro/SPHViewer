@@ -227,6 +227,7 @@ class GLComponent{
 public:
   virtual void draw(GLProgram* program, float* camera)=0;
   virtual void set_rebuffer()=0;
+  virtual void change_strength(float amount)=0;
 };
 
 void* window_instance = NULL;
@@ -242,6 +243,9 @@ private:
   float _camera[3];
   float _rmatrix[16];
   float _cmatrix[16];
+  
+  GLuint _fb;
+  GLuint _rb;
   
   GLProgram* _program;
   vector<GLComponent*> _components;
@@ -288,6 +292,37 @@ private:
                             0., 0., 0., 1.};
     multiply(_rmatrix, newrmatrix);
     glutPostRedisplay();
+  }
+  
+  void setup_framebuffer(unsigned int* dimensions){
+    glGenFramebuffersEXT(1, &_fb);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, _fb);
+    glGenRenderbuffersEXT(1, &_rb);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, _rb);
+    glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, dimensions[0], dimensions[1]);
+    glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, _rb);
+    GLenum status;
+    status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+    if(status != GL_FRAMEBUFFER_COMPLETE_EXT){
+      cerr << "Error in creating image framebuffer" << endl;
+    }
+    // set up the view with the correct framebuffer dimensions
+    glViewport(0, 0, dimensions[0], dimensions[1]);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45., float(dimensions[0])/float(dimensions[1]), 0.1, 100.);
+  }
+  
+  void unset_framebuffer(){
+    // reset the view
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glViewport(0, 0, _dimensions[0], _dimensions[1]);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45., float(_dimensions[0])/float(_dimensions[1]), 0.1, 100.);
+    // delete the framebuffer
+    glDeleteRenderbuffersEXT(1, &_rb);
+    glDeleteFramebuffersEXT(1, &_fb);
   }
 
 public:
@@ -432,11 +467,12 @@ public:
     }
   }
   
-  void saveImage(){
+  void saveImage(unsigned int* dimensions){
+    display();
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    char* data = new char[4*_dimensions[0]*_dimensions[1]];
-    glReadPixels(0, 0, _dimensions[0], _dimensions[1],
-                 GL_RGBA, GL_UNSIGNED_BYTE, data);
+    char* data = new char[3*dimensions[0]*dimensions[1]];
+    glReadPixels(0, 0, dimensions[0], dimensions[1],
+                 GL_RGB, GL_UNSIGNED_BYTE, data);
     
     string fname = get_unique_imagename();
     FILE* file = fopen(fname.c_str(), "wb");
@@ -469,21 +505,17 @@ public:
     }
   
     png_init_io(png_ptr, file);
-    png_set_IHDR(png_ptr, info_ptr, _dimensions[0], _dimensions[1], 8,
-                 PNG_COLOR_TYPE_RGB_ALPHA,
+    png_set_IHDR(png_ptr, info_ptr, dimensions[0], dimensions[1], 8,
+                 PNG_COLOR_TYPE_RGB,
                  PNG_INTERLACE_ADAM7, PNG_COMPRESSION_TYPE_DEFAULT,
                  PNG_FILTER_TYPE_DEFAULT);
  
-    char** rows = new char*[_dimensions[1]];
-    for(unsigned int i = 0; i < _dimensions[1]; i++){
-      rows[i] = new char[4*_dimensions[0]];
-      unsigned int k = _dimensions[1] - i - 1;
-      for(unsigned int j = 0; j < _dimensions[0]; j++){
-        rows[i][4*j] = data[k*_dimensions[0]*4+4*j];
-        rows[i][4*j+1] = data[k*_dimensions[0]*4+4*j+1];
-        rows[i][4*j+2] = data[k*_dimensions[0]*4+4*j+2];
-        rows[i][4*j+3] = 255;
-      }
+    char** rows = new char*[dimensions[1]];
+    for(unsigned int i = 0; i < dimensions[1]; i++){
+      // luckily, glReadPixels also returns data row per row
+      // unfortunately, the offset is the lower left corner, while we start
+      // in the upper left corner for our file
+      rows[i] = &data[(dimensions[1] - i - 1)*dimensions[0]*3];
     }
     png_set_rows(png_ptr, info_ptr, (png_bytepp)rows);
     png_write_png(png_ptr, info_ptr, PNG_TRANSFORM_IDENTITY, NULL);
@@ -491,20 +523,32 @@ public:
     png_destroy_write_struct(&png_ptr, &info_ptr);
     fclose(file);
   
-    for(unsigned int i = 0; i < _dimensions[1]; i++){
-      delete [] rows[i];
-    }
     delete [] rows;
-    
     delete [] data;
     
     cout << "Wrote image file \"" << fname << "\"" << endl;
   }
   
+  void change_strength(float amount){
+    _components[1]->change_strength(amount);
+    glutPostRedisplay();
+  }
+  
   void keyfunctions(unsigned char key, int x, int y){
+    // image dimensions
+    unsigned int dimensions[2] = {_dimensions[0]*2, _dimensions[1]*2};
     switch(key){
       case 'p':
-        saveImage();
+        // initialize a separate framebuffer to render to
+        setup_framebuffer(dimensions);
+        saveImage(dimensions);
+        unset_framebuffer();
+        break;
+      case 'e':
+        change_strength(+0.1);
+        break;
+      case 'd':
+        change_strength(-0.1);
         break;
     }
   }
@@ -798,7 +842,35 @@ public:
   void set_rebuffer(){
     _do_rebuffer = true;
   }
+  
+  void change_strength(float amount){
+    _density_strength += amount;
+  }
 };
+
+void read_positions(float* positions, ifstream& ifile){
+  unsigned int blocksize;
+  ifile.read((char*)&blocksize, 4);
+  // skip end of name block and beginning of data block
+  ifile.seekg(8, ios_base::cur);
+  unsigned int numpart = (blocksize-8)/12;
+  for(unsigned int i = 0; i < numpart; i++){
+    ifile.read((char*)&positions[3*i], 12);
+  }
+  ifile.seekg(4, ios_base::cur);
+}
+
+void read_array(float* array, ifstream& ifile){
+  unsigned int blocksize;
+  ifile.read((char*)&blocksize, 4);
+  // skip end of name block and beginning of data block
+  ifile.seekg(8, ios_base::cur);
+  unsigned int numpart = (blocksize-8)/4;
+  for(unsigned int i = 0; i < numpart; i++){
+    ifile.read((char*)&array[i], 4);
+  }
+  ifile.seekg(4, ios_base::cur);
+}
 
 int main(int argc, char** argv){
   parse_options(argc, argv);
@@ -817,61 +889,164 @@ int main(int argc, char** argv){
   attributes.push_back("aTemperature");
   GLProgram program("shader.vert", "shader.frag", uniforms, attributes);
   
-  ifstream file("gas.dat", ios::in|ios::binary|ios::ate);
-  streampos size = file.tellg();
-  float * data = new float[size/sizeof(float)];
-  file.seekg(0, ios::beg);
-  file.read(reinterpret_cast<char*>(data), size);
-  unsigned int numpoints = size/(6*sizeof(float));
-  vector<double> positions(3*numpoints);
-  vector<double> smoothings(numpoints);
-  vector<double> densities(numpoints);
-  vector<double> temperatures(numpoints);
-  double maxdensity = 0.;
-  double maxtemperature = 2.e4;
-  for(unsigned int i = 0; i < numpoints; i++){
-    positions[3*i] = data[6*i];
-    positions[3*i+1] = data[6*i+1];
-    positions[3*i+2] = data[6*i+2];
-    smoothings[i] = data[6*i+4];
-    densities[i] = data[6*i+3];
-    temperatures[i] = data[6*i+5];
-    maxdensity = max(maxdensity, densities[i]);
+  ifstream ifile("snapshot_0015", ios::in | ios::binary);
+  
+  unsigned int numgaspart;
+  unsigned int ndark;
+  unsigned int nstar;
+  char a[5];
+  a[4] = '\0';
+  unsigned int blocksize;
+  bool flags[4] = {false, false, false, false};
+  bool all = false;
+  
+  // skip header
+  ifile.seekg(20, ios_base::cur);
+  ifile.read((char*)&numgaspart, 4);
+  ifile.read((char*)&ndark, 4);
+  ifile.seekg(8, ios_base::cur);
+  ifile.read((char*)&nstar, 4);
+  ifile.seekg(244, ios_base::cur);
+  
+  float* positions = new float[3*(numgaspart+ndark+nstar)];
+  float* densities = new float[numgaspart];
+  float* smoothings = new float[numgaspart];
+  float* temperatures = new float[numgaspart];
+  
+  while(!all && ifile.good()){
+    ifile.read(a, 4);
+    string name(a);
+    bool found = false;
+    if(name == "POS "){
+      flags[0] = true;
+      found = true;
+      read_positions(positions, ifile);
+    }
+    if(name == "RHO "){
+      flags[1] = true;
+      found = true;
+      read_array(densities, ifile);
+    }
+    if(name == "HSML"){
+      flags[2] = true;
+      found = true;
+      read_array(smoothings, ifile);
+    }
+    if(name == "TEMP"){
+      flags[3] = true;
+      found = true;
+      read_array(temperatures, ifile);
+    }
+  
+    if(found){
+      // skip beginning of next name block (4 bytes)
+      ifile.seekg(4, ios_base::cur);
+    } else {
+      ifile.read((char*)&blocksize, 4);
+      // skip end of name block (4 bytes) + complete block + begin of next name
+      // block (4 bytes)
+      ifile.seekg(blocksize+8, ios_base::cur);
+    }
+    all = flags[0] & flags[1] & flags[2] & flags[3];
   }
-  delete [] data;
-  file.close();
-  for(unsigned int i = 0; i < numpoints; i++){
-    densities[i] /= maxdensity;
-    temperatures[i] /= maxtemperature;
+  
+  vector<double> gaspositions(3*numgaspart);
+  vector<double> gassmoothings(numgaspart);
+  vector<double> gasdensities(numgaspart);
+  vector<double> gastemperatures(numgaspart);
+  double maxgasdensity = 0.;
+  double maxgastemperature = 2.e4;
+  for(unsigned int i = 0; i < numgaspart; i++){
+    gaspositions[3*i] = positions[3*i];
+    gaspositions[3*i+1] = positions[3*i+1];
+    gaspositions[3*i+2] = positions[3*i+2];
+    gasdensities[i] = densities[i];
+    gassmoothings[i] = smoothings[i];
+    gastemperatures[i] = temperatures[i];
+    maxgasdensity = max(maxgasdensity, gasdensities[i]);
+  }
+  for(unsigned int i = 0; i < numgaspart; i++){
+    gasdensities[i] /= maxgasdensity;
+    gastemperatures[i] /= maxgastemperature;
   }
   Kernel kernel(0.5, 32./3./50.);
-  PointSet pointset(positions, smoothings, densities, temperatures, kernel);
+  PointSet gas(gaspositions, gassmoothings, gasdensities, gastemperatures, kernel);
   
-  file.open("stars.dat", ios::in|ios::binary|ios::ate);
-  size = file.tellg();
-  data = new float[size/sizeof(float)];
-  file.seekg(0, ios::beg);
-  file.read(reinterpret_cast<char*>(data), size);
-  numpoints = size/(3*sizeof(float));
-  positions.resize(3*numpoints);
-  smoothings.resize(numpoints);
-  densities.resize(numpoints);
-  temperatures.resize(numpoints);
-  for(unsigned int i = 0; i < numpoints; i++){
-    positions[3*i] = data[3*i];
-    positions[3*i+1] = data[3*i+1];
-    positions[3*i+2] = data[3*i+2];
-    smoothings[i] = 0.025;
-    densities[i] = 0.00116;
-    temperatures[i] = 0.00116;
+  vector<double> starpositions(3*nstar);
+  vector<double> starsmoothings(nstar);
+  vector<double> stardensities(nstar);
+  vector<double> startemperatures(nstar);
+  unsigned int offset = 3*(numgaspart+ndark);
+  for(unsigned int i = 0; i < nstar; i++){
+    starpositions[3*i] = positions[offset+3*i];
+    starpositions[3*i+1] = positions[offset+3*i+1];
+    starpositions[3*i+2] = positions[offset+3*i+2];
+    starsmoothings[i] = 0.025;
+    stardensities[i] = 0.00116;
+    startemperatures[i] = 0.00116;
   }
-  delete [] data;
-  file.close();
   Kernel kernel2(0.04, 0.5);
-  PointSet stars(positions, smoothings, densities, temperatures, kernel2, 100., 100.);
+  PointSet stars(starpositions, starsmoothings, stardensities, startemperatures, kernel2, 100., 100.);
+  delete [] positions;
+  delete [] densities;
+  delete [] smoothings;
+  delete [] temperatures;
+  
+//  ifstream file("gas.dat", ios::in|ios::binary|ios::ate);
+//  streampos size = file.tellg();
+//  float * data = new float[size/sizeof(float)];
+//  file.seekg(0, ios::beg);
+//  file.read(reinterpret_cast<char*>(data), size);
+//  unsigned int numpoints = size/(6*sizeof(float));
+//  vector<double> positions(3*numpoints);
+//  vector<double> smoothings(numpoints);
+//  vector<double> densities(numpoints);
+//  vector<double> temperatures(numpoints);
+//  double maxdensity = 0.;
+//  double maxtemperature = 2.e4;
+//  for(unsigned int i = 0; i < numpoints; i++){
+//    positions[3*i] = data[6*i];
+//    positions[3*i+1] = data[6*i+1];
+//    positions[3*i+2] = data[6*i+2];
+//    smoothings[i] = data[6*i+4];
+//    densities[i] = data[6*i+3];
+//    temperatures[i] = data[6*i+5];
+//    maxdensity = max(maxdensity, densities[i]);
+//  }
+//  delete [] data;
+//  file.close();
+//  for(unsigned int i = 0; i < numpoints; i++){
+//    densities[i] /= maxdensity;
+//    temperatures[i] /= maxtemperature;
+//  }
+//  Kernel kernel(0.5, 32./3./50.);
+//  PointSet pointset(positions, smoothings, densities, temperatures, kernel);
+//  
+//  file.open("stars.dat", ios::in|ios::binary|ios::ate);
+//  size = file.tellg();
+//  data = new float[size/sizeof(float)];
+//  file.seekg(0, ios::beg);
+//  file.read(reinterpret_cast<char*>(data), size);
+//  numpoints = size/(3*sizeof(float));
+//  positions.resize(3*numpoints);
+//  smoothings.resize(numpoints);
+//  densities.resize(numpoints);
+//  temperatures.resize(numpoints);
+//  for(unsigned int i = 0; i < numpoints; i++){
+//    positions[3*i] = data[3*i];
+//    positions[3*i+1] = data[3*i+1];
+//    positions[3*i+2] = data[3*i+2];
+//    smoothings[i] = 0.025;
+//    densities[i] = 0.00116;
+//    temperatures[i] = 0.00116;
+//  }
+//  delete [] data;
+//  file.close();
+//  Kernel kernel2(0.04, 0.5);
+//  PointSet stars(positions, smoothings, densities, temperatures, kernel2, 100., 100.);
   
   window.add_component(&stars);
-  window.add_component(&pointset);
+  window.add_component(&gas);
   
   window.start(&program);
   
