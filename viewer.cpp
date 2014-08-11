@@ -4,11 +4,13 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <map>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <getopt.h>
+#include <png.h>
 using namespace std;
 
 bool stereo = false;
@@ -51,6 +53,16 @@ string B_to_string(unsigned int bytes){
     }
   }
   return result.str();
+}
+
+string get_unique_imagename(){
+  stringstream fname;
+  fname << "image_";
+  time_t timev;
+  time(&timev);
+  fname << timev;
+  fname << ".png";
+  return fname.str();
 }
 
 void unit_matrix(float* matrix){
@@ -420,8 +432,81 @@ public:
     }
   }
   
-  void keyfunctions(unsigned char key, int x, int y){
+  void saveImage(){
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    char* data = new char[4*_dimensions[0]*_dimensions[1]];
+    glReadPixels(0, 0, _dimensions[0], _dimensions[1],
+                 GL_RGBA, GL_UNSIGNED_BYTE, data);
     
+    string fname = get_unique_imagename();
+    FILE* file = fopen(fname.c_str(), "wb");
+    if(!file){
+      cerr << "Error: file could not be created!" << endl;
+      exit(1);
+    }
+    
+    png_structp png_ptr = 
+      png_create_write_struct(PNG_LIBPNG_VER_STRING,
+                              (png_voidp)NULL,
+                              NULL, NULL);
+    if(!png_ptr){
+      cerr << "Error allocating png write struct!" << endl;
+      exit(1);
+    }
+  
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if(!info_ptr){
+      png_destroy_write_struct(&png_ptr, (png_infopp)NULL);
+      cerr << "Error allocating info struct!" << endl;
+      exit(1);
+    }
+  
+    if(setjmp(png_jmpbuf(png_ptr))){
+      png_destroy_write_struct(&png_ptr, &info_ptr);
+      fclose(file);
+      cerr << "Error writing PNG" << endl;
+      exit(1);
+    }
+  
+    png_init_io(png_ptr, file);
+    png_set_IHDR(png_ptr, info_ptr, _dimensions[0], _dimensions[1], 8,
+                 PNG_COLOR_TYPE_RGB_ALPHA,
+                 PNG_INTERLACE_ADAM7, PNG_COMPRESSION_TYPE_DEFAULT,
+                 PNG_FILTER_TYPE_DEFAULT);
+ 
+    char** rows = new char*[_dimensions[1]];
+    for(unsigned int i = 0; i < _dimensions[1]; i++){
+      rows[i] = new char[4*_dimensions[0]];
+      unsigned int k = _dimensions[1] - i - 1;
+      for(unsigned int j = 0; j < _dimensions[0]; j++){
+        rows[i][4*j] = data[k*_dimensions[0]*4+4*j];
+        rows[i][4*j+1] = data[k*_dimensions[0]*4+4*j+1];
+        rows[i][4*j+2] = data[k*_dimensions[0]*4+4*j+2];
+        rows[i][4*j+3] = 255;
+      }
+    }
+    png_set_rows(png_ptr, info_ptr, (png_bytepp)rows);
+    png_write_png(png_ptr, info_ptr, PNG_TRANSFORM_IDENTITY, NULL);
+    png_write_end(png_ptr, info_ptr);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(file);
+  
+    for(unsigned int i = 0; i < _dimensions[1]; i++){
+      delete [] rows[i];
+    }
+    delete [] rows;
+    
+    delete [] data;
+    
+    cout << "Wrote image file \"" << fname << "\"" << endl;
+  }
+  
+  void keyfunctions(unsigned char key, int x, int y){
+    switch(key){
+      case 'p':
+        saveImage();
+        break;
+    }
   }
   
   static void displayWrapper(){
