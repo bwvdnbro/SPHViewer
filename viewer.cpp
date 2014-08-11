@@ -467,14 +467,13 @@ public:
     }
   }
   
-  void saveImage(unsigned int* dimensions){
+  void saveImage(unsigned int* dimensions, string fname){
     display();
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     char* data = new char[3*dimensions[0]*dimensions[1]];
     glReadPixels(0, 0, dimensions[0], dimensions[1],
                  GL_RGB, GL_UNSIGNED_BYTE, data);
     
-    string fname = get_unique_imagename();
     FILE* file = fopen(fname.c_str(), "wb");
     if(!file){
       cerr << "Error: file could not be created!" << endl;
@@ -534,6 +533,22 @@ public:
     glutPostRedisplay();
   }
   
+  void make_movie(){
+    unsigned int dimensions[2] = {500, 500};
+    setup_framebuffer(dimensions);
+    for(unsigned int i = 0; i < 100; i++){
+      rotate(0.02*M_PI, 0.);
+      stringstream fname;
+      fname << "movie";
+      fname.fill('0');
+      fname.width(3);
+      fname << i;
+      fname << ".png";
+      saveImage(dimensions, fname.str());
+    }
+    unset_framebuffer();
+  }
+  
   void keyfunctions(unsigned char key, int x, int y){
     // image dimensions
     unsigned int dimensions[2] = {_dimensions[0]*2, _dimensions[1]*2};
@@ -541,7 +556,7 @@ public:
       case 'p':
         // initialize a separate framebuffer to render to
         setup_framebuffer(dimensions);
-        saveImage(dimensions);
+        saveImage(dimensions, get_unique_imagename());
         unset_framebuffer();
         break;
       case 'e':
@@ -549,6 +564,9 @@ public:
         break;
       case 'd':
         change_strength(-0.1);
+        break;
+      case 'm':
+        make_movie();
         break;
     }
   }
