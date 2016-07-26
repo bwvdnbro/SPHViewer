@@ -11,34 +11,85 @@
 #include <vector>
 #include <getopt.h>
 #include <png.h>
+#include <pthread.h>
 using namespace std;
 
-bool stereo = false;
+/* TODO:
+    - Kernel leaks GPU memory by not freeing texture memory...
+*/
 
-void parse_options(int argc, char** argv){
-  static struct option long_options[] = {
-    {"stereo", no_argument, 0, 's'},
-    {0, 0, 0, 0}
-  };
+// we need this to fix a very strange ldd bug when using OpenGL.
+// details can be found on https://bugs.launchpad.net/ubuntu/+source/nvidia-graphics-drivers-319/+bug/1248642
+// the most important thing is that this effectively fixes the problem :p
+int pthreadconcurrency = pthread_getconcurrency();
+
+// class used to parse options (using getopt_long)
+// the options are stored in internal variables that can then be read out
+class OptionParser{
+private:
+  bool _stereo;
+  string _ifilename;
+  string _ofilename;
+  bool _view;
   
-  int c;
-  opterr = 0;
-  while((c = getopt_long(argc, argv, "s", long_options, NULL)) != -1){
-    switch(c){
-      case 's':
-        stereo = true;
-        cout << "Displaying stereo view" << endl;
-        break;
-      case '?':
-        cout << "unknown option: " << argv[optind-1] << endl;
-        break;
-      default:
-        cout << "error" << endl;
-        break;
+public:
+  OptionParser(int argc, char** argv){
+    _stereo = false;
+    _view = true;
+    
+    static struct option long_options[] = {
+      {"stereo", no_argument, 0, 's'},
+      {"input", required_argument, 0, 'i'},
+      {"output", required_argument, 0, 'o'},
+      {"noview", no_argument, 0, 'n'},
+      {0, 0, 0, 0}
+    };
+    
+    int c;
+    opterr = 0;
+    while((c = getopt_long(argc, argv, "si:o:n", long_options, NULL)) != -1){
+      switch(c){
+        case 's':
+          _stereo = true;
+          cout << "Displaying stereo view" << endl;
+          break;
+        case 'i':
+          _ifilename = string(optarg);
+          break;
+        case 'o':
+          _ofilename = string(optarg);
+          break;
+        case 'n':
+          _view = false;
+          break;
+        case '?':
+          cout << "unknown option: " << argv[optind-1] << endl;
+          break;
+        default:
+          cout << "error" << endl;
+          break;
+      }
     }
   }
-}
+  
+  bool get_stereo(){
+    return _stereo;
+  }
+  
+  string get_ifilename(){
+    return _ifilename;
+  }
+  
+  string get_ofilename(){
+    return _ofilename;
+  }
+  
+  bool get_view(){
+    return _view;
+  }
+};
 
+// function to print pretty byte size strings
 string B_to_string(unsigned int bytes){
   stringstream result;
   if(bytes < 1024){
@@ -55,6 +106,7 @@ string B_to_string(unsigned int bytes){
   return result.str();
 }
 
+// function that returns a unique filename based on the current system time
 string get_unique_imagename(){
   stringstream fname;
   fname << "image_";
@@ -65,6 +117,7 @@ string get_unique_imagename(){
   return fname.str();
 }
 
+// method that sets a linearized 4x4 matrix to the 4x4 unit matrix
 void unit_matrix(float* matrix){
   for(unsigned int i = 0; i < 16; i++){
     matrix[i] = 0.;
@@ -75,6 +128,7 @@ void unit_matrix(float* matrix){
   matrix[15] = 1.;
 }
 
+// method that transposes a linearized 4x4 matrix
 void transpose(float* matrix){
   float newmatrix[16];
   for(unsigned int i = 0; i < 4; i++){
@@ -87,6 +141,8 @@ void transpose(float* matrix){
   }
 }
 
+// method that multiplies two linearized 4x4 matrices. The result is stored in
+// matrix A
 void multiply(float* A, float* B){
   float C[16] = {0.};
   unsigned int k;
@@ -103,6 +159,8 @@ void multiply(float* A, float* B){
   }
 }
 
+// method that multiplies two linearized 4x4 matrices. The result is stored in
+// matrix B (contrary to the method above)
 void premultiply(float* A, float* B){
   float C[16] = {0.};
   unsigned int k;
@@ -119,6 +177,8 @@ void premultiply(float* A, float* B){
   }
 }
 
+// method that rotates the given linearized 4x4 matrix with the given angle
+// around the x-axis
 void rotate_x(float* matrix, double angle){
   float xrot[16] = {cos(angle), 0., -sin(angle), 0.,
                     0., 1., 0., 0.,
@@ -127,6 +187,8 @@ void rotate_x(float* matrix, double angle){
   multiply(matrix, xrot);
 }
 
+// method that rotates the given linearized 4x4 matrix with the given angle
+// around the y-axis
 void rotate_y(float* matrix, double angle){
   float yrot[16] = {1., 0., 0., 0.,
                     0., cos(angle), sin(angle), 0.,
@@ -135,6 +197,9 @@ void rotate_y(float* matrix, double angle){
   multiply(matrix, yrot);
 }
 
+// general wrapper around a GL program (created with glCreateProgram)
+// the program is the actual code running on the GPU and consists of
+// shaders and pointers to memory on the GPU
 class GLProgram{
 private:
   GLuint _program;
@@ -223,6 +288,8 @@ public:
   }
 };
 
+// general interface for components that can be drawn on the GPU using
+// a GLProgram.
 class GLComponent{
 public:
   virtual void draw(GLProgram* program, float* camera)=0;
@@ -230,8 +297,23 @@ public:
   virtual void change_strength(float amount)=0;
 };
 
+class GLComponentProvider{
+public:
+  virtual GLComponent* get_gas()=0;
+  virtual GLComponent* get_stars()=0;
+  virtual bool prev()=0;
+  virtual bool next()=0;
+};
+
+// global variable workaround for the fact that GLUT callback functions take
+// no arguments. We store a pointer to the active Window as a global variable,
+// that is then used by static functions in Window to call the corresponding
+// non-static functions that do have access to non-global Window members.
 void* window_instance = NULL;
 
+// General wrapper around the glut window functionality. This class shows
+// a window, draws its contents and deals with all callback functions that
+// allow a user to interact with the window.
 class Window{
 private:
   int _dimensions[2];
@@ -244,10 +326,13 @@ private:
   float _rmatrix[16];
   float _cmatrix[16];
   
+  bool _stereo;
+  
   GLuint _fb;
   GLuint _rb;
   
   GLProgram* _program;
+  GLComponentProvider* _provider;
   vector<GLComponent*> _components;
   
   void rotate(double xangle, double yangle){
@@ -326,8 +411,10 @@ private:
   }
 
 public:
-  Window(int* argc, char** argv, int width, int height){
+  Window(int* argc, char** argv, int width, int height, bool stereo){
     window_instance = this;
+    
+    _stereo = stereo;
     
     _dimensions[0] = width;
     _dimensions[1] = height;
@@ -338,16 +425,16 @@ public:
     
     _center[0] = 0.;
     _center[1] = 0.;
-    _center[2] = -5.;
+    _center[2] = -20.;
     
     _camera[0] = 0.;
     _camera[1] = 0.;
-    _camera[2] = 5.;
+    _camera[2] = 20.;
     unit_matrix(_rmatrix);
     unit_matrix(_cmatrix);
     
     glutInit(argc, argv);
-    if(stereo){
+    if(_stereo){
       glutInitDisplayMode(GLUT_STEREO | GL_DOUBLE);
     } else {
       glutInitDisplayMode(GL_DOUBLE);
@@ -377,13 +464,29 @@ public:
     _components.push_back(component);
   }
   
-  void start(GLProgram* program){
+  void set_component_provider(GLComponentProvider* provider){
+    _provider = provider;
+    if(_provider->get_stars()){
+      add_component(_provider->get_stars());
+    }
+    add_component(_provider->get_gas());
+  }
+  
+  void start(GLProgram* program, bool view, string ofilename){
     _program = program;
-    glutMainLoop();
+    if(view){
+      glutMainLoop();
+    } else {
+      rotate(0., 0.5*M_PI);
+      unsigned int dimensions[2] = {500, 500};
+      setup_framebuffer(dimensions);
+      saveImage(dimensions, ofilename);
+      unset_framebuffer();
+    }
   }
   
   void displaywrapper(){
-    if(stereo){
+    if(_stereo){
       glDrawBuffer(GL_BACK_LEFT);
       display();
       double view_angle = 0.034906585;
@@ -534,18 +637,52 @@ public:
   }
   
   void make_movie(){
+    // movie that rotates around the view
+//    unsigned int dimensions[2] = {500, 500};
+//    setup_framebuffer(dimensions);
+//    for(unsigned int i = 0; i < 100; i++){
+//      rotate(0., 0.02*M_PI);
+//      stringstream fname;
+//      fname << "movie";
+//      fname.fill('0');
+//      fname.width(3);
+//      fname << i;
+//      fname << ".png";
+//      saveImage(dimensions, fname.str());
+//    }
+//    unset_framebuffer();
+    // movie that loops over all remaining snapshots
     unsigned int dimensions[2] = {500, 500};
     setup_framebuffer(dimensions);
-    for(unsigned int i = 0; i < 100; i++){
-      rotate(0.02*M_PI, 0.);
+    saveImage(dimensions, "movie/movie0000.png");
+    unsigned int i = 1;
+    while(_provider->next()){
+      _components.clear();
+      if(_provider->get_stars()){
+        add_component(_provider->get_stars());
+      }
+      add_component(_provider->get_gas());
       stringstream fname;
-      fname << "movie";
+      fname << "movie/movie";
       fname.fill('0');
-      fname.width(3);
+      fname.width(4);
       fname << i;
       fname << ".png";
       saveImage(dimensions, fname.str());
+      i++;
     }
+    _components.clear();
+    if(_provider->get_stars()){
+      add_component(_provider->get_stars());
+    }
+    add_component(_provider->get_gas());
+    stringstream fname;
+    fname << "movie/movie";
+    fname.fill('0');
+    fname.width(4);
+    fname << i;
+    fname << ".png";
+    saveImage(dimensions, fname.str());
     unset_framebuffer();
   }
   
@@ -567,6 +704,24 @@ public:
         break;
       case 'm':
         make_movie();
+        break;
+      case 'b':
+        _provider->prev();
+        _components.clear();
+        if(_provider->get_stars()){
+          add_component(_provider->get_stars());
+        }
+        add_component(_provider->get_gas());
+        glutPostRedisplay();
+        break;
+      case 'f':
+        _provider->next();
+        _components.clear();
+        if(_provider->get_stars()){
+          add_component(_provider->get_stars());
+        }
+        add_component(_provider->get_gas());
+        glutPostRedisplay();
         break;
     }
   }
@@ -596,6 +751,9 @@ public:
   }
 };
 
+// This class generates a texture that consists of a spline kernel blob.
+// It generates the correct pixel values and initializes the texture on
+// the GPU.
 class Kernel{
 private:
   double _h;
@@ -648,6 +806,8 @@ public:
   }
 };
 
+// General sort function used to sort a list of indices based on the provided
+// array of depths
 class PointSorter{
 private:
   double* _depths;
@@ -662,6 +822,9 @@ public:
   }
 };
 
+// Actual implementation of a GLComponent to render a set of blobby points
+// on the GPU. The points are generated using a texture generated by a provided
+// Kernel instance.
 class PointSet : public GLComponent{
 private:
   unsigned int _numpoints;
@@ -809,7 +972,7 @@ public:
     glGenBuffers(_numbuffer, _dbo);
     glGenBuffers(_numbuffer, _hbo);
     glGenBuffers(_numbuffer, _ibo);
-    float camera[3] = {0., 0., 5.};
+    float camera[3] = {0., 0., 20.};
     rebuffer(camera);
     _do_rebuffer = false;
     cout << "Allocated " << B_to_string(_memsize) << " on GPU" << endl;
@@ -821,6 +984,12 @@ public:
     delete [] _densities;
     delete [] _temperatures;
     
+    glDeleteBuffers(_numbuffer, _vbo);
+    glDeleteBuffers(_numbuffer, _tbo);
+    glDeleteBuffers(_numbuffer, _sbo);
+    glDeleteBuffers(_numbuffer, _dbo);
+    glDeleteBuffers(_numbuffer, _hbo);
+    glDeleteBuffers(_numbuffer, _ibo);
     delete [] _numvertices;
     delete [] _vbo;
     delete [] _tbo;
@@ -866,33 +1035,244 @@ public:
   }
 };
 
-void read_positions(float* positions, ifstream& ifile){
-  unsigned int blocksize;
-  ifile.read((char*)&blocksize, 4);
-  // skip end of name block and beginning of data block
-  ifile.seekg(8, ios_base::cur);
-  unsigned int numpart = (blocksize-8)/12;
-  for(unsigned int i = 0; i < numpart; i++){
-    ifile.read((char*)&positions[3*i], 12);
+// Wrapper around a Gadget2 snapshot. The snapshot is read in and two pointsets
+// are generated: one for the gas and one for the stars
+class DataSet : public GLComponentProvider{
+private:
+  PointSet* _gas;
+  PointSet* _stars;
+  string _basename;
+  unsigned int _current;
+  unsigned int _size;
+  double _maxdensity;
+  double _maxtemperature;
+  
+  void read_positions(float* positions, ifstream& ifile){
+    unsigned int blocksize;
+    ifile.read((char*)&blocksize, 4);
+    // skip end of name block and beginning of data block
+    ifile.seekg(8, ios_base::cur);
+    unsigned int numpart = (blocksize-8)/12;
+    for(unsigned int i = 0; i < numpart; i++){
+      ifile.read((char*)&positions[3*i], 12);
+    }
+    ifile.seekg(4, ios_base::cur);
   }
-  ifile.seekg(4, ios_base::cur);
-}
 
-void read_array(float* array, ifstream& ifile){
-  unsigned int blocksize;
-  ifile.read((char*)&blocksize, 4);
-  // skip end of name block and beginning of data block
-  ifile.seekg(8, ios_base::cur);
-  unsigned int numpart = (blocksize-8)/4;
-  for(unsigned int i = 0; i < numpart; i++){
-    ifile.read((char*)&array[i], 4);
+  void read_array(float* array, ifstream& ifile){
+    unsigned int blocksize;
+    ifile.read((char*)&blocksize, 4);
+    // skip end of name block and beginning of data block
+    ifile.seekg(8, ios_base::cur);
+    unsigned int numpart = (blocksize-8)/4;
+    for(unsigned int i = 0; i < numpart; i++){
+      ifile.read((char*)&array[i], 4);
+    }
+    ifile.seekg(4, ios_base::cur);
   }
-  ifile.seekg(4, ios_base::cur);
-}
+  
+  void load_snapshot(string filename, double custommaxdensity = 0., double custommaxtemperature = 0.){
+    ifstream ifile(filename.c_str(), ios::in | ios::binary);
+    
+    unsigned int numgaspart;
+    unsigned int ndark;
+    unsigned int nstar;
+    char a[5];
+    a[4] = '\0';
+    unsigned int blocksize;
+    bool flags[4] = {false, false, false, false};
+    bool all = false;
+    
+    // skip header
+    ifile.seekg(20, ios_base::cur);
+    ifile.read((char*)&numgaspart, 4);
+    ifile.read((char*)&ndark, 4);
+    ifile.seekg(8, ios_base::cur);
+    ifile.read((char*)&nstar, 4);
+    ifile.seekg(244, ios_base::cur);
+    
+    float* positions = new float[3*(numgaspart+ndark+nstar)];
+    float* densities = new float[numgaspart];
+    float* smoothings = new float[numgaspart];
+    float* temperatures = new float[numgaspart];
+    
+    while(!all && ifile.good()){
+      ifile.read(a, 4);
+      string name(a);
+      bool found = false;
+      if(name == "POS "){
+        flags[0] = true;
+        found = true;
+        read_positions(positions, ifile);
+      }
+      if(name == "RHO "){
+        flags[1] = true;
+        found = true;
+        read_array(densities, ifile);
+      }
+      if(name == "HSML"){
+        flags[2] = true;
+        found = true;
+        read_array(smoothings, ifile);
+      }
+      if(name == "TEMP"){
+        flags[3] = true;
+        found = true;
+        read_array(temperatures, ifile);
+      }
+    
+      if(found){
+        // skip beginning of next name block (4 bytes)
+        ifile.seekg(4, ios_base::cur);
+      } else {
+        ifile.read((char*)&blocksize, 4);
+        // skip end of name block (4 bytes) + complete block + begin of next name
+        // block (4 bytes)
+        ifile.seekg(blocksize+8, ios_base::cur);
+      }
+      all = flags[0] & flags[1] & flags[2] & flags[3];
+    }
+    
+    float com[3] = {0., 0., 0.};
+    // centering on the gas does not work for some reason
+    // we therefore center on the stars (if possible)
+    if(nstar){
+      float totmass = 0.;
+      for(unsigned int i = (numgaspart+ndark); i < (numgaspart+ndark+nstar); i++){
+        float mass = 1.;
+        com[0] += mass*positions[3*i];
+        com[1] += mass*positions[3*i+1];
+        com[2] += mass*positions[3*i+2];
+        totmass += mass;
+      }
+      com[0] /= totmass;
+      com[1] /= totmass;
+      com[2] /= totmass;
+    }
+    cout << "Center of mass: (" << com[0] << "," << com[1] << "," << com[2] << ")" << endl;
+    
+    vector<double> gaspositions(3*numgaspart);
+    vector<double> gassmoothings(numgaspart);
+    vector<double> gasdensities(numgaspart);
+    vector<double> gastemperatures(numgaspart);
+    double maxgasdensity = 0.;
+    double maxgastemperature = 2.e4;
+    for(unsigned int i = 0; i < numgaspart; i++){
+      gaspositions[3*i] = positions[3*i]-com[0];
+      gaspositions[3*i+1] = positions[3*i+1]-com[1];
+      gaspositions[3*i+2] = positions[3*i+2]-com[2];
+      gasdensities[i] = densities[i];
+      gassmoothings[i] = smoothings[i];
+      gastemperatures[i] = temperatures[i];
+      maxgasdensity = max(maxgasdensity, gasdensities[i]);
+    }
+    if(custommaxdensity){
+      maxgasdensity = custommaxdensity;
+    }
+    if(custommaxtemperature){
+      maxgastemperature = custommaxtemperature;
+    }
+    for(unsigned int i = 0; i < numgaspart; i++){
+      gasdensities[i] /= maxgasdensity;
+      gastemperatures[i] /= maxgastemperature;
+    }
+    cout << "Max density: " << maxgasdensity << endl;
+    Kernel kernel(0.5, 32./3./50.);
+    _gas = new PointSet(gaspositions, gassmoothings, gasdensities, gastemperatures, kernel);
+    
+    if(nstar){
+      vector<double> starpositions(3*nstar);
+      vector<double> starsmoothings(nstar);
+      vector<double> stardensities(nstar);
+      vector<double> startemperatures(nstar);
+      unsigned int offset = 3*(numgaspart+ndark);
+      for(unsigned int i = 0; i < nstar; i++){
+        starpositions[3*i] = positions[offset+3*i]-com[0];
+        starpositions[3*i+1] = positions[offset+3*i+1]-com[1];
+        starpositions[3*i+2] = positions[offset+3*i+2]-com[2];
+        starsmoothings[i] = 0.025;
+        stardensities[i] = 0.00116;
+        startemperatures[i] = 0.00116;
+      }
+      Kernel kernel2(0.04, 0.5);
+      _stars = new PointSet(starpositions, starsmoothings, stardensities, startemperatures, kernel2, 100., 100.);
+    } else {
+      _stars = NULL;
+    }
+    delete [] positions;
+    delete [] densities;
+    delete [] smoothings;
+    delete [] temperatures;
+  }
+  
+  void free_memory(){
+    delete _gas;
+    delete _stars;
+  }
+  
+  string get_current_name(){
+    stringstream name;
+    name << _basename;
+    name.fill('0');
+    name.width(4);
+    name << _current;
+    return name.str();
+  }
 
+public:
+  DataSet(string basename, unsigned int size, double maxdensity = 0., double maxtemperature = 0.){
+    _basename = basename;
+    _current = 0;
+    _size = size;
+    _maxdensity = maxdensity;
+    _maxtemperature = maxtemperature;
+    string filename = get_current_name();
+    load_snapshot(filename, _maxdensity, _maxtemperature);
+  }
+  
+  ~DataSet(){
+    free_memory();
+  }
+  
+  GLComponent* get_gas(){
+    return _gas;
+  }
+  
+  GLComponent* get_stars(){
+    return _stars;
+  }
+  
+  bool prev(){
+    free_memory();
+    _current = (_current+_size-1)%_size;
+    string filename = get_current_name();
+    load_snapshot(filename, _maxdensity, _maxtemperature);
+    return _current > 0;
+  }
+  
+  bool next(){
+    free_memory();
+    _current = (_current+1)%_size;
+    string filename = get_current_name();
+    load_snapshot(filename, _maxdensity, _maxtemperature);
+    return _current < (_size-1);
+  }
+};
+
+// main program:
+//  - we read in the command line arguments
+//  - we generate a window
+//  - we create a GLProgram
+//  - we read in the requested snapshot
+//  - we add the dataset PointSets to the window
+//  - we initialize the window
 int main(int argc, char** argv){
-  parse_options(argc, argv);
-  Window window(&argc, argv, 400, 400);
+  OptionParser parser(argc, argv);
+  bool stereo = parser.get_stereo();
+  string ifilename = parser.get_ifilename();
+  string ofilename = parser.get_ofilename();
+  bool view = parser.get_view();
+  Window window(&argc, argv, 400, 400, stereo);
   
   vector<string> uniforms;
   uniforms.push_back("strength");
@@ -907,166 +1287,19 @@ int main(int argc, char** argv){
   attributes.push_back("aTemperature");
   GLProgram program("shader.vert", "shader.frag", uniforms, attributes);
   
-  ifstream ifile("snapshot_0015", ios::in | ios::binary);
-  
-  unsigned int numgaspart;
-  unsigned int ndark;
-  unsigned int nstar;
-  char a[5];
-  a[4] = '\0';
-  unsigned int blocksize;
-  bool flags[4] = {false, false, false, false};
-  bool all = false;
-  
-  // skip header
-  ifile.seekg(20, ios_base::cur);
-  ifile.read((char*)&numgaspart, 4);
-  ifile.read((char*)&ndark, 4);
-  ifile.seekg(8, ios_base::cur);
-  ifile.read((char*)&nstar, 4);
-  ifile.seekg(244, ios_base::cur);
-  
-  float* positions = new float[3*(numgaspart+ndark+nstar)];
-  float* densities = new float[numgaspart];
-  float* smoothings = new float[numgaspart];
-  float* temperatures = new float[numgaspart];
-  
-  while(!all && ifile.good()){
-    ifile.read(a, 4);
-    string name(a);
-    bool found = false;
-    if(name == "POS "){
-      flags[0] = true;
-      found = true;
-      read_positions(positions, ifile);
-    }
-    if(name == "RHO "){
-      flags[1] = true;
-      found = true;
-      read_array(densities, ifile);
-    }
-    if(name == "HSML"){
-      flags[2] = true;
-      found = true;
-      read_array(smoothings, ifile);
-    }
-    if(name == "TEMP"){
-      flags[3] = true;
-      found = true;
-      read_array(temperatures, ifile);
-    }
-  
-    if(found){
-      // skip beginning of next name block (4 bytes)
-      ifile.seekg(4, ios_base::cur);
-    } else {
-      ifile.read((char*)&blocksize, 4);
-      // skip end of name block (4 bytes) + complete block + begin of next name
-      // block (4 bytes)
-      ifile.seekg(blocksize+8, ios_base::cur);
-    }
-    all = flags[0] & flags[1] & flags[2] & flags[3];
+  if(ifilename == ""){
+    ifilename = "data/snapshot_";
   }
   
-  vector<double> gaspositions(3*numgaspart);
-  vector<double> gassmoothings(numgaspart);
-  vector<double> gasdensities(numgaspart);
-  vector<double> gastemperatures(numgaspart);
-  double maxgasdensity = 0.;
-  double maxgastemperature = 2.e4;
-  for(unsigned int i = 0; i < numgaspart; i++){
-    gaspositions[3*i] = positions[3*i];
-    gaspositions[3*i+1] = positions[3*i+1];
-    gaspositions[3*i+2] = positions[3*i+2];
-    gasdensities[i] = densities[i];
-    gassmoothings[i] = smoothings[i];
-    gastemperatures[i] = temperatures[i];
-    maxgasdensity = max(maxgasdensity, gasdensities[i]);
-  }
-  for(unsigned int i = 0; i < numgaspart; i++){
-    gasdensities[i] /= maxgasdensity;
-    gastemperatures[i] /= maxgastemperature;
-  }
-  Kernel kernel(0.5, 32./3./50.);
-  PointSet gas(gaspositions, gassmoothings, gasdensities, gastemperatures, kernel);
+  DataSet data(ifilename, 1201, 1., 2.e4);
   
-  vector<double> starpositions(3*nstar);
-  vector<double> starsmoothings(nstar);
-  vector<double> stardensities(nstar);
-  vector<double> startemperatures(nstar);
-  unsigned int offset = 3*(numgaspart+ndark);
-  for(unsigned int i = 0; i < nstar; i++){
-    starpositions[3*i] = positions[offset+3*i];
-    starpositions[3*i+1] = positions[offset+3*i+1];
-    starpositions[3*i+2] = positions[offset+3*i+2];
-    starsmoothings[i] = 0.025;
-    stardensities[i] = 0.00116;
-    startemperatures[i] = 0.00116;
-  }
-  Kernel kernel2(0.04, 0.5);
-  PointSet stars(starpositions, starsmoothings, stardensities, startemperatures, kernel2, 100., 100.);
-  delete [] positions;
-  delete [] densities;
-  delete [] smoothings;
-  delete [] temperatures;
-  
-//  ifstream file("gas.dat", ios::in|ios::binary|ios::ate);
-//  streampos size = file.tellg();
-//  float * data = new float[size/sizeof(float)];
-//  file.seekg(0, ios::beg);
-//  file.read(reinterpret_cast<char*>(data), size);
-//  unsigned int numpoints = size/(6*sizeof(float));
-//  vector<double> positions(3*numpoints);
-//  vector<double> smoothings(numpoints);
-//  vector<double> densities(numpoints);
-//  vector<double> temperatures(numpoints);
-//  double maxdensity = 0.;
-//  double maxtemperature = 2.e4;
-//  for(unsigned int i = 0; i < numpoints; i++){
-//    positions[3*i] = data[6*i];
-//    positions[3*i+1] = data[6*i+1];
-//    positions[3*i+2] = data[6*i+2];
-//    smoothings[i] = data[6*i+4];
-//    densities[i] = data[6*i+3];
-//    temperatures[i] = data[6*i+5];
-//    maxdensity = max(maxdensity, densities[i]);
+//  if(data.get_stars()){
+//    window.add_component(data.get_stars());
 //  }
-//  delete [] data;
-//  file.close();
-//  for(unsigned int i = 0; i < numpoints; i++){
-//    densities[i] /= maxdensity;
-//    temperatures[i] /= maxtemperature;
-//  }
-//  Kernel kernel(0.5, 32./3./50.);
-//  PointSet pointset(positions, smoothings, densities, temperatures, kernel);
-//  
-//  file.open("stars.dat", ios::in|ios::binary|ios::ate);
-//  size = file.tellg();
-//  data = new float[size/sizeof(float)];
-//  file.seekg(0, ios::beg);
-//  file.read(reinterpret_cast<char*>(data), size);
-//  numpoints = size/(3*sizeof(float));
-//  positions.resize(3*numpoints);
-//  smoothings.resize(numpoints);
-//  densities.resize(numpoints);
-//  temperatures.resize(numpoints);
-//  for(unsigned int i = 0; i < numpoints; i++){
-//    positions[3*i] = data[3*i];
-//    positions[3*i+1] = data[3*i+1];
-//    positions[3*i+2] = data[3*i+2];
-//    smoothings[i] = 0.025;
-//    densities[i] = 0.00116;
-//    temperatures[i] = 0.00116;
-//  }
-//  delete [] data;
-//  file.close();
-//  Kernel kernel2(0.04, 0.5);
-//  PointSet stars(positions, smoothings, densities, temperatures, kernel2, 100., 100.);
+//  window.add_component(data.get_gas());
+  window.set_component_provider(&data);
   
-  window.add_component(&stars);
-  window.add_component(&gas);
-  
-  window.start(&program);
+  window.start(&program, view, ofilename);
   
   return 0;
 }

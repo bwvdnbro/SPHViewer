@@ -1,3 +1,3 @@
 #! /bin/bash
 
-g++ -g -o viewer viewer.cpp -lGL -lglut -lGLU -lGLEW -lpng
+g++ -g -o viewer viewer.cpp -lGL -lglut -lGLU -lGLEW -lpng -lpthread
